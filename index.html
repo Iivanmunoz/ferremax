@@ -1215,53 +1215,84 @@
   }
 
   /* ── FETCH GOOGLE SHEETS (CSV) ── */
-  function fetchSheet(id, sheetName) {
-    showLoading();
-    const url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
-    fetch(url)
-      .then(r => {
-        if (!r.ok) throw new Error('No se pudo conectar');
-        return r.text();
-      })
-      .then(csv => {
-        const products = parseCSV(csv);
-        if (products.length === 0) throw new Error('No se encontraron productos');
-        allProducts = products;
-        document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('es-MX');
-        showUI();
-        renderProducts(allProducts);
-        buildCategoryFilters();
-        showToast(`${products.length} productos cargados`, '🎉');
-      })
-      .catch(err => {
-        showError(err.message);
-        showToast('Error al conectar: ' + err.message, '❌');
-      });
+function fetchSheet(idOrUrl, sheetName) {
+  showLoading();
+  
+  let url;
+  
+  // Detectar si es una URL completa o solo un ID
+  if (idOrUrl.includes('http')) {
+    // Es una URL completa - usar directamente
+    url = idOrUrl;
+    // Si tiene parámetros adicionales, asegurarse de que output sea csv
+    if (!url.includes('output=csv')) {
+      url = url.replace(/pub\?.*$/, 'pub?output=csv');
+    }
+  } else {
+    // Es solo un ID - construir URL con gviz
+    url = `https://docs.google.com/spreadsheets/d/${idOrUrl}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
   }
+  
+  fetch(url)
+    .then(r => {
+      if (!r.ok) throw new Error('No se pudo conectar');
+      return r.text();
+    })
+    .then(csv => {
+      const products = parseCSV(csv);
+      if (products.length === 0) throw new Error('No se encontraron productos');
+      allProducts = products;
+      document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('es-MX');
+      showUI();
+      renderProducts(allProducts);
+      buildCategoryFilters();
+      showToast(`${products.length} productos cargados`, '🎉');
+    })
+    .catch(err => {
+      showError(err.message);
+      showToast('Error al conectar: ' + err.message, '❌');
+    });
+}
 
   /* ── PARSE CSV ── */
-  function parseCSV(csv) {
-    const lines = csv.split('\n').filter(l => l.trim());
-    if (lines.length < 2) return [];
-    // Skip header row (line 0)
-    const rows = lines.slice(1);
-    return rows.map((line, i) => {
-      const cols = parseCSVLine(line);
-      const rawPrice = parseFloat((cols[4] || '0').replace(/[^0-9.]/g, '')) || 0;
-      return {
-        id: i,
-        codigo: cleanVal(cols[0]) || `PROD-${i+1}`,
-        nombre: cleanVal(cols[1]) || 'Sin nombre',
-        descripcion: cleanVal(cols[2]) || 'Sin descripción',
-        ubicacion: cleanVal(cols[3]) || 'No especificada',
-        precioBase: rawPrice,
-        precioIVA: rawPrice * (1 + IVA),
-        imagen: cleanVal(cols[5]) || '',
-        stock: cleanVal(cols[6]) || 'Disponible',
-        categoria: cleanVal(cols[7]) || 'General',
-      };
-    }).filter(p => p.nombre !== 'Sin nombre' || p.codigo !== 'PROD-' + (p.id+1));
-  }
+function parseCSV(csv) {
+  const lines = csv.split('\n').filter(l => l.trim());
+  if (lines.length < 2) return [];
+  
+  // Skip header row (line 0)
+  const rows = lines.slice(1);
+  
+  return rows.map((line, i) => {
+    const cols = parseCSVLine(line);
+    
+    // Columnas según tu imagen:
+    // A: id (ignorado, se genera automático)
+    // B: clave → codigo
+    // C: descripcion → nombre
+    // D: ubicacion
+    // E: precio (base)
+    // F: precioCliente (vacío, se calcula)
+    // G: stock
+    
+    const precioBase = parseFloat((cols[4] || '0').replace(/[^0-9.]/g, '')) || 0;
+    // Precio cliente = precio base + IVA + 30% de ganancia
+    const precioCliente = precioBase * (1 + IVA) * 1.30;
+    
+    return {
+      id: i + 1, // ID autoincremental comenzando en 1
+      codigo: cleanVal(cols[1]) || `PROD-${i + 1}`,
+      nombre: cleanVal(cols[2]) || 'Sin nombre',
+      descripcion: cleanVal(cols[2]) || 'Sin descripción', // Mismo que nombre
+      ubicacion: cleanVal(cols[3]) || 'No especificada',
+      precioBase: precioBase,
+      precioIVA: precioBase * (1 + IVA), // Solo con IVA
+      precioCliente: Math.round(precioCliente * 100) / 100, // Con IVA + 30% ganancia, redondeado a 2 decimales
+      stock: cleanVal(cols[6]) || 'Disponible',
+      imagen: '', // No hay columna de imagen en tu estructura
+      categoria: 'General', // No hay columna de categoría en tu estructura
+    };
+  }).filter(p => p.nombre !== 'Sin nombre');
+}
 
   function parseCSVLine(line) {
     const result = [];
@@ -1403,42 +1434,231 @@
     applyFilters();
   }
 
-  /* ── SEARCH ── */
-  document.addEventListener('DOMContentLoaded', () => {
-    const inp = document.getElementById('searchInput');
-    const clr = document.getElementById('searchClear');
-    inp.addEventListener('input', () => {
-      clr.style.display = inp.value ? 'flex' : 'none';
-      applyFilters();
-    });
-  });
-
-  function clearSearch() {
-    document.getElementById('searchInput').value = '';
-    document.getElementById('searchClear').style.display = 'none';
+/* ── SEARCH ── */
+document.addEventListener('DOMContentLoaded', () => {
+  const inp = document.getElementById('searchInput');
+  const clr = document.getElementById('searchClear');
+  const suggestionsDiv = document.getElementById('searchSuggestions') || createSuggestionsDiv();
+  
+  // Búsqueda en tiempo real con cada letra
+  inp.addEventListener('input', (e) => {
+    const value = e.target.value;
+    clr.style.display = value ? 'flex' : 'none';
+    
+    // Mostrar sugerencias desde la primera letra
+    if (value.length >= 1) {
+      showSuggestions(value, suggestionsDiv);
+    } else {
+      hideSuggestions(suggestionsDiv);
+    }
+    
     applyFilters();
+  });
+  
+  // Ocultar sugerencias al hacer clic fuera
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.search-wrapper')) {
+      hideSuggestions(suggestionsDiv);
+    }
+  });
+  
+  // Navegación con teclado en sugerencias
+  inp.addEventListener('keydown', (e) => {
+    handleKeyboardNavigation(e, suggestionsDiv);
+  });
+});
+
+// Crear contenedor de sugerencias si no existe
+function createSuggestionsDiv() {
+  const div = document.createElement('div');
+  div.id = 'searchSuggestions';
+  div.className = 'search-suggestions';
+  div.style.cssText = `
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: rgba(15, 23, 42, 0.95);
+    border: 1px solid rgba(94, 234, 212, 0.3);
+    border-radius: 12px;
+    max-height: 250px;
+    overflow-y: auto;
+    z-index: 1000;
+    display: none;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    backdrop-filter: blur(10px);
+    margin-top: 8px;
+  `;
+  
+  const searchWrapper = document.querySelector('.search-wrapper');
+  searchWrapper.style.position = 'relative';
+  searchWrapper.appendChild(div);
+  
+  return div;
+}
+
+// Mostrar sugerencias de búsqueda
+function showSuggestions(query, container) {
+  const q = query.toLowerCase().trim();
+  
+  // Buscar coincidencias en código, nombre y descripción
+  const matches = allProducts.filter(p => 
+    p.codigo.toLowerCase().includes(q) ||
+    p.nombre.toLowerCase().includes(q) ||
+    p.descripcion.toLowerCase().includes(q)
+  ).slice(0, 5);
+  
+  if (matches.length === 0) {
+    hideSuggestions(container);
+    return;
   }
+  
+  container.innerHTML = matches.map((p, index) => `
+    <div class="suggestion-item" data-index="${index}" data-id="${p.id}" onclick="selectSuggestion(${p.id})" style="
+      padding: 12px 16px;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(94, 234, 212, 0.1);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      transition: all 0.2s;
+      color: #e2e8f0;
+    " onmouseover="this.style.background='rgba(56, 189, 248, 0.15)'; this.style.borderLeft='3px solid #38bdf8'" onmouseout="this.style.background='transparent'; this.style.borderLeft='3px solid transparent'" onmousedown="event.preventDefault()">
+      <div style="flex: 1;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+          <strong style="color: #38bdf8; font-size: 0.9rem;">${highlightMatch(p.codigo, q)}</strong>
+          <span style="font-size: 0.75rem; color: #64748b; background: rgba(100,116,139,0.2); padding: 2px 6px; border-radius: 4px;">${p.ubicacion}</span>
+        </div>
+        <div style="font-size: 0.85em; color: #94a3b8; line-height: 1.3;">
+          ${highlightMatch(p.nombre, q)}
+        </div>
+      </div>
+      <div style="text-align: right; margin-left: 12px;">
+        <div style="color: #5eead4; font-weight: 600; font-size: 0.9rem;">${fmt(p.precioIVA)}</div>
+        <div style="font-size: 0.75rem; color: #64748b; margin-top: 2px;">c/IVA</div>
+      </div>
+    </div>
+  `).join('');
+  
+  container.style.display = 'block';
+  window.currentSuggestions = matches;
+  window.selectedSuggestionIndex = -1;
+}
 
-  function applyFilters() {
-    const q = (document.getElementById('searchInput').value || '').toLowerCase().trim();
+// Resaltar texto coincidente
+function highlightMatch(text, query) {
+  if (!query) return text;
+  const regex = new RegExp(`(${escapeRegex(query)})`, 'gi');
+  return text.replace(regex, '<mark style="background: rgba(255, 235, 59, 0.3); color: #fef08a; padding: 0 2px; border-radius: 2px;">$1</mark>');
+}
+
+// Escapar caracteres especiales para regex
+function escapeRegex(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Ocultar sugerencias
+function hideSuggestions(container) {
+  if (container) {
+    container.style.display = 'none';
+  }
+  window.currentSuggestions = [];
+  window.selectedSuggestionIndex = -1;
+}
+
+// Seleccionar sugerencia - CORREGIDO: ahora busca por ID exacto
+function selectSuggestion(productId) {
+  const product = allProducts.find(p => p.id === productId);
+  if (!product) return;
+  
+  const input = document.getElementById('searchInput');
+  input.value = product.codigo; // Muestra el código en el input
+  document.getElementById('searchClear').style.display = 'flex';
+  hideSuggestions(document.getElementById('searchSuggestions'));
+  
+  // Renderiza SOLO ese producto específico
+  renderProducts([product]);
+  showToast(`Mostrando: ${product.nombre}`, '✅');
+}
+
+// Navegación con teclado
+function handleKeyboardNavigation(e, container) {
+  if (!window.currentSuggestions || window.currentSuggestions.length === 0) return;
+  
+  const items = container.querySelectorAll('.suggestion-item');
+  
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    window.selectedSuggestionIndex = Math.min(window.selectedSuggestionIndex + 1, items.length - 1);
+    updateSelection(items);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    window.selectedSuggestionIndex = Math.max(window.selectedSuggestionIndex - 1, -1);
+    updateSelection(items);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (window.selectedSuggestionIndex >= 0) {
+      const selectedId = parseInt(items[window.selectedSuggestionIndex].dataset.id);
+      selectSuggestion(selectedId);
+    } else {
+      // Si no hay selección, aplicar filtro normal
+      applyFilters();
+      hideSuggestions(container);
+    }
+  } else if (e.key === 'Escape') {
+    hideSuggestions(container);
+  }
+}
+
+// Actualizar selección visual
+function updateSelection(items) {
+  items.forEach((item, index) => {
+    if (index === window.selectedSuggestionIndex) {
+      item.style.background = 'rgba(56, 189, 248, 0.25)';
+      item.style.borderLeft = '3px solid #38bdf8';
+      item.scrollIntoView({ block: 'nearest' });
+    } else {
+      item.style.background = 'transparent';
+      item.style.borderLeft = '3px solid transparent';
+    }
+  });
+}
+
+function clearSearch() {
+  document.getElementById('searchInput').value = '';
+  document.getElementById('searchClear').style.display = 'none';
+  hideSuggestions(document.getElementById('searchSuggestions'));
+  applyFilters(); // Esto mostrará todos los productos de nuevo
+}
+
+function applyFilters() {
+  const q = (document.getElementById('searchInput').value || '').toLowerCase().trim();
+  
+  // Si el input está vacío, mostrar todos (respetando categoría)
+  if (!q) {
     let filtered = allProducts;
-
-    if (activeCategory && activeCategory !== 'Todos') {
+    if (activeCategory && activeCategory !== 'all' && activeCategory !== 'Todos') {
       filtered = filtered.filter(p => p.categoria === activeCategory);
     }
-
-    if (q) {
-      filtered = filtered.filter(p =>
-        p.nombre.toLowerCase().includes(q) ||
-        p.codigo.toLowerCase().includes(q) ||
-        p.descripcion.toLowerCase().includes(q) ||
-        p.ubicacion.toLowerCase().includes(q) ||
-        p.categoria.toLowerCase().includes(q)
-      );
-    }
-
     renderProducts(filtered);
+    return;
   }
+
+  // Búsqueda por coincidencias parciales
+  let filtered = allProducts.filter(p =>
+    p.nombre.toLowerCase().includes(q) ||
+    p.codigo.toLowerCase().includes(q) ||
+    p.descripcion.toLowerCase().includes(q) ||
+    p.ubicacion.toLowerCase().includes(q)
+  );
+
+  // Si hay categoría activa (que no sea "Todos"), filtrar también por categoría
+  if (activeCategory && activeCategory !== 'all' && activeCategory !== 'Todos') {
+    filtered = filtered.filter(p => p.categoria === activeCategory);
+  }
+
+  renderProducts(filtered);
+}
 
   /* ── CART ── */
   function addToCart(productId) {
